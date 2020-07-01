@@ -88,17 +88,18 @@ public:
 	// then several blocks of MAX_BLOCK_SIZE each are reserved (including
 	// at least one extra buffer block).
 	AE_NO_TSAN explicit ReaderWriterQueue(size_t size = 15)
+		: checkInData({ nullptr, 0, false })
 #ifndef NDEBUG
-		: enqueuing(false)
-		,dequeuing(false)
+		, enqueuing(false)
+		, dequeuing(false)
 #endif
 	{
 		assert(size > 0);
 		assert(MAX_BLOCK_SIZE == ceilToPow2(MAX_BLOCK_SIZE) && "MAX_BLOCK_SIZE must be a power of 2");
 		assert(MAX_BLOCK_SIZE >= 2 && "MAX_BLOCK_SIZE must be at least 2");
-		
+
 		Block* firstBlock = nullptr;
-		
+
 		largestBlockSize = ceilToPow2(size + 1);		// We need a spare slot to fit size elements in the block
 		if (largestBlockSize > MAX_BLOCK_SIZE * 2) {
 			// We need a spare block in case the producer is writing to a different block the consumer is reading from, and
@@ -141,7 +142,7 @@ public:
 		}
 		frontBlock = firstBlock;
 		tailBlock = firstBlock;
-		
+
 		// Make sure the reader/writer threads will have the initialized memory setup above:
 		fence(memory_order_sync);
 	}
@@ -151,7 +152,8 @@ public:
 	AE_NO_TSAN ReaderWriterQueue(ReaderWriterQueue&& other)
 		: frontBlock(other.frontBlock.load()),
 		tailBlock(other.tailBlock.load()),
-		largestBlockSize(other.largestBlockSize)
+		largestBlockSize(other.largestBlockSize),
+		checkInData(other.checkInData)
 #ifndef NDEBUG
 		,enqueuing(false)
 		,dequeuing(false)
@@ -182,6 +184,7 @@ public:
 		tailBlock = other.tailBlock.load();
 		other.tailBlock = b;
 		std::swap(largestBlockSize, other.largestBlockSize);
+		checkInData = other.checkInData;
 		return *this;
 	}
 
@@ -205,7 +208,7 @@ public:
 				element->~T();
 				(void)element;
 			}
-			
+
 			auto rawBlock = block->rawThis;
 			block->~Block();
 			std::free(rawBlock);
@@ -219,7 +222,7 @@ public:
 	// Does not allocate memory.
 	AE_FORCEINLINE bool try_enqueue(T const& element) AE_NO_TSAN
 	{
-		return inner_enqueue<CannotAlloc>(element);
+		return inner_enqueue<CannotAlloc, false>(element);
 	}
 
 	// Enqueues a moved copy of element if there is room in the queue.
@@ -227,7 +230,7 @@ public:
 	// Does not allocate memory.
 	AE_FORCEINLINE bool try_enqueue(T&& element) AE_NO_TSAN
 	{
-		return inner_enqueue<CannotAlloc>(std::forward<T>(element));
+		return inner_enqueue<CannotAlloc, false>(std::forward<T>(element));
 	}
 
 #if MOODYCAMEL_HAS_EMPLACE
@@ -235,7 +238,7 @@ public:
 	template<typename... Args>
 	AE_FORCEINLINE bool try_emplace(Args&&... args) AE_NO_TSAN
 	{
-		return inner_enqueue<CannotAlloc>(std::forward<Args>(args)...);
+		return inner_enqueue<CannotAlloc, false>(std::forward<Args>(args)...);
 	}
 #endif
 
@@ -260,9 +263,44 @@ public:
 	template<typename... Args>
 	AE_FORCEINLINE bool emplace(Args&&... args) AE_NO_TSAN
 	{
-		return inner_enqueue<CanAlloc>(std::forward<Args>(args)...);
+		return inner_enqueue<CanAlloc, false>(std::forward<Args>(args)...);
 	}
 #endif
+
+#if MOODYCAMEL_HAS_EMPLACE
+	template<typename... Args>
+	AE_FORCEINLINE T* reserve(Args&&... args) AE_NO_TSAN
+	{
+		if (inner_enqueue<CanAlloc, true>(std::forward<Args>(args)...)) {
+			// return the object which has been reserved.
+			return reinterpret_cast<T*>(checkInData.tailBlock->data + (checkInData.tail-1) * sizeof(T));
+		}
+		return  nullptr;
+	}
+#endif
+
+	AE_FORCEINLINE void checkIn() AE_NO_TSAN
+	{
+		if (checkInData.tailBlock == nullptr) {
+			// nothing to do
+			return;
+		}
+
+		if (checkInData.insert) {
+			Block* tailBlock_ = tailBlock.load();
+			tailBlock_->next = checkInData.tailBlock;
+			fence(memory_order_release);
+			tailBlock = checkInData.tailBlock;
+			checkInData.tailBlock->next = tailBlock_->next.load();
+		} else {
+			checkInData.tailBlock->tail = checkInData.tail;
+			fence(memory_order_release);
+			tailBlock = checkInData.tailBlock;
+		}
+
+		// mark as done
+		checkInData.tailBlock = nullptr;
+	}
 
 	// Attempts to dequeue an element; if the queue is empty,
 	// returns false instead. If the queue has at least one element,
@@ -290,14 +328,14 @@ public:
 		// where we have the fast path if the front block is not empty, then read the tail block,
 		// then re-read the front block and check if it's not empty again, then check if the tail
 		// block has advanced.
-		
+
 		Block* frontBlock_ = frontBlock.load();
 		size_t blockTail = frontBlock_->localTail;
 		size_t blockFront = frontBlock_->front.load();
-		
+
 		if (blockFront != blockTail || blockFront != (frontBlock_->localTail = frontBlock_->tail.load())) {
 			fence(memory_order_acquire);
-			
+
 		non_empty_front_block:
 			// Front block not empty, dequeue from here
 			auto element = reinterpret_cast<T*>(frontBlock_->data + blockFront * sizeof(T));
@@ -316,12 +354,12 @@ public:
 			blockTail = frontBlock_->localTail = frontBlock_->tail.load();
 			blockFront = frontBlock_->front.load();
 			fence(memory_order_acquire);
-			
+
 			if (blockFront != blockTail) {
 				// Oh look, the front block isn't empty after all
 				goto non_empty_front_block;
 			}
-			
+
 			// Front block is empty but there's another block ahead, advance to it
 			Block* nextBlock = frontBlock_->next;
 			// Don't need an acquire fence here since next can only ever be set on the tailBlock,
@@ -344,12 +382,12 @@ public:
 			compiler_fence(memory_order_release);	// Not strictly needed
 
 			auto element = reinterpret_cast<T*>(frontBlock_->data + nextBlockFront * sizeof(T));
-			
+
 			result = std::move(*element);
 			element->~T();
 
 			nextBlockFront = (nextBlockFront + 1) & frontBlock_->sizeMask;
-			
+
 			fence(memory_order_release);
 			frontBlock_->front = nextBlockFront;
 		}
@@ -360,7 +398,6 @@ public:
 
 		return true;
 	}
-
 
 	// Returns a pointer to the front element in the queue (the one that
 	// would be removed next by a call to `try_dequeue` or `pop`). If the
@@ -377,7 +414,7 @@ public:
 		Block* frontBlock_ = frontBlock.load();
 		size_t blockTail = frontBlock_->localTail;
 		size_t blockFront = frontBlock_->front.load();
-		
+
 		if (blockFront != blockTail || blockFront != (frontBlock_->localTail = frontBlock_->tail.load())) {
 			fence(memory_order_acquire);
 		non_empty_front_block:
@@ -389,23 +426,23 @@ public:
 			blockTail = frontBlock_->localTail = frontBlock_->tail.load();
 			blockFront = frontBlock_->front.load();
 			fence(memory_order_acquire);
-			
+
 			if (blockFront != blockTail) {
 				goto non_empty_front_block;
 			}
-			
+
 			Block* nextBlock = frontBlock_->next;
-			
+
 			size_t nextBlockFront = nextBlock->front.load();
 			fence(memory_order_acquire);
 
 			assert(nextBlockFront != nextBlock->tail.load());
 			return reinterpret_cast<T*>(nextBlock->data + nextBlockFront * sizeof(T));
 		}
-		
+
 		return nullptr;
 	}
-	
+
 	// Removes the front element from the queue, if any, without returning it.
 	// Returns true on success, or false if the queue appeared empty at the time
 	// `pop` was called.
@@ -415,14 +452,14 @@ public:
 		ReentrantGuard guard(this->dequeuing);
 #endif
 		// See try_dequeue() for reasoning
-		
+
 		Block* frontBlock_ = frontBlock.load();
 		size_t blockTail = frontBlock_->localTail;
 		size_t blockFront = frontBlock_->front.load();
-		
+
 		if (blockFront != blockTail || blockFront != (frontBlock_->localTail = frontBlock_->tail.load())) {
 			fence(memory_order_acquire);
-			
+
 		non_empty_front_block:
 			auto element = reinterpret_cast<T*>(frontBlock_->data + blockFront * sizeof(T));
 			element->~T();
@@ -438,14 +475,14 @@ public:
 			blockTail = frontBlock_->localTail = frontBlock_->tail.load();
 			blockFront = frontBlock_->front.load();
 			fence(memory_order_acquire);
-			
+
 			if (blockFront != blockTail) {
 				goto non_empty_front_block;
 			}
-			
+
 			// Front block is empty but there's another block ahead, advance to it
 			Block* nextBlock = frontBlock_->next;
-			
+
 			size_t nextBlockFront = nextBlock->front.load();
 			size_t nextBlockTail = nextBlock->localTail = nextBlock->tail.load();
 			fence(memory_order_acquire);
@@ -462,7 +499,7 @@ public:
 			element->~T();
 
 			nextBlockFront = (nextBlockFront + 1) & frontBlock_->sizeMask;
-			
+
 			fence(memory_order_release);
 			frontBlock_->front = nextBlockFront;
 		}
@@ -473,7 +510,7 @@ public:
 
 		return true;
 	}
-	
+
 	// Returns the approximate number of items currently in the queue.
 	// Safe to call from both the producer and consumer threads.
 	inline size_t size_approx() const AE_NO_TSAN
@@ -512,12 +549,11 @@ public:
 		return result;
 	}
 
-
 private:
 	enum AllocationMode { CanAlloc, CannotAlloc };
 
 #if MOODYCAMEL_HAS_EMPLACE
-	template<AllocationMode canAlloc, typename... Args>
+	template<AllocationMode canAlloc, bool checkIn, typename... Args>
 	bool inner_enqueue(Args&&... args) AE_NO_TSAN
 #else
 	template<AllocationMode canAlloc, typename U>
@@ -550,8 +586,14 @@ private:
 			new (location) T(std::forward<U>(element));
 #endif
 
-			fence(memory_order_release);
-			tailBlock_->tail = nextBlockTail;
+			if constexpr (!checkIn) {
+				fence(memory_order_release);
+				tailBlock_->tail = nextBlockTail;
+			} else {
+				checkInData.tailBlock = tailBlock_;
+				checkInData.tail = nextBlockTail;
+				checkInData.insert = false;
+			}
 		}
 		else {
 			fence(memory_order_acquire);
@@ -573,7 +615,6 @@ private:
 				// go through the blocks in a circle
 				assert(nextBlockFront == nextBlockTail);
 				tailBlockNext->localFront = nextBlockFront;
-
 				char* location = tailBlockNext->data + nextBlockTail * sizeof(T);
 #if MOODYCAMEL_HAS_EMPLACE
 				new (location) T(std::forward<Args>(args)...);
@@ -581,10 +622,15 @@ private:
 				new (location) T(std::forward<U>(element));
 #endif
 
-				tailBlockNext->tail = (nextBlockTail + 1) & tailBlockNext->sizeMask;
-
-				fence(memory_order_release);
-				tailBlock = tailBlockNext;
+				if constexpr (!checkIn) {
+					tailBlockNext->tail = (nextBlockTail + 1) & tailBlockNext->sizeMask;
+					fence(memory_order_release);
+					tailBlock = tailBlockNext;
+				} else {
+					checkInData.tailBlock = tailBlockNext;
+					checkInData.tail = (nextBlockTail + 1) & tailBlockNext->sizeMask;
+					checkInData.insert = false;
+				}
 			}
 			else if (canAlloc == CanAlloc) {
 				// tailBlock is full and there's no free block ahead; create a new block
@@ -604,17 +650,24 @@ private:
 				assert(newBlock->front == 0);
 				newBlock->tail = newBlock->localTail = 1;
 
-				newBlock->next = tailBlock_->next.load();
-				tailBlock_->next = newBlock;
+				if constexpr (!checkIn) {
+					tailBlock_->next = newBlock;
 
-				// Might be possible for the dequeue thread to see the new tailBlock->next
-				// *without* seeing the new tailBlock value, but this is OK since it can't
-				// advance to the next block until tailBlock is set anyway (because the only
-				// case where it could try to read the next is if it's already at the tailBlock,
-				// and it won't advance past tailBlock in any circumstance).
+					// Might be possible for the dequeue thread to see the new tailBlock->next
+					// *without* seeing the new tailBlock value, but this is OK since it can't
+					// advance to the next block until tailBlock is set anyway (because the only
+					// case where it could try to read the next is if it's already at the tailBlock,
+					// and it won't advance past tailBlock in any circumstance).
 
-				fence(memory_order_release);
-				tailBlock = newBlock;
+					fence(memory_order_release);
+					tailBlock = newBlock;
+
+					newBlock->next = tailBlock_->next.load();
+				} else {
+					fence(memory_order_release);
+					checkInData.tailBlock = newBlock;
+					checkInData.insert = true;
+				}
 			}
 			else if (canAlloc == CannotAlloc) {
 				// Would have had to allocate a new block to enqueue, but not allowed
@@ -650,7 +703,7 @@ private:
 		++x;
 		return x;
 	}
-	
+
 	template<typename U>
 	static AE_FORCEINLINE char* align_for(char* ptr) AE_NO_TSAN
 	{
@@ -683,14 +736,14 @@ private:
 		// Avoid false-sharing by putting highly contended variables on their own cache lines
 		weak_atomic<size_t> front;	// (Atomic) Elements are read from here
 		size_t localTail;			// An uncontended shadow copy of tail, owned by the consumer
-		
+
 		char cachelineFiller0[MOODYCAMEL_CACHE_LINE_SIZE - sizeof(weak_atomic<size_t>) - sizeof(size_t)];
 		weak_atomic<size_t> tail;	// (Atomic) Elements are enqueued here
 		size_t localFront;
-		
+
 		char cachelineFiller1[MOODYCAMEL_CACHE_LINE_SIZE - sizeof(weak_atomic<size_t>) - sizeof(size_t)];	// next isn't very contended, but we don't want it on the same cache line as tail (which is)
 		weak_atomic<Block*> next;	// (Atomic)
-		
+
 		char* data;		// Contents (on heap) are aligned to T's alignment
 
 		const size_t sizeMask;
@@ -709,8 +762,8 @@ private:
 	public:
 		char* rawThis;
 	};
-	
-	
+
+
 	static Block* make_block(size_t capacity) AE_NO_TSAN
 	{
 		// Allocate enough memory for the block itself, as well as all the elements it will contain
@@ -720,7 +773,7 @@ private:
 		if (newBlockRaw == nullptr) {
 			return nullptr;
 		}
-		
+
 		auto newBlockAligned = align_for<Block>(newBlockRaw);
 		auto newBlockData = align_for<T>(newBlockAligned + sizeof(Block));
 		return new (newBlockAligned) Block(capacity, newBlockRaw, newBlockData);
@@ -728,9 +781,15 @@ private:
 
 private:
 	weak_atomic<Block*> frontBlock;		// (Atomic) Elements are dequeued from this block
-	
+
 	char cachelineFiller[MOODYCAMEL_CACHE_LINE_SIZE - sizeof(weak_atomic<Block*>)];
 	weak_atomic<Block*> tailBlock;		// (Atomic) Elements are enqueued to this block
+
+	struct {
+		Block* tailBlock;
+		size_t tail;
+		bool insert;
+	} checkInData;
 
 	size_t largestBlockSize;
 
@@ -746,7 +805,7 @@ class BlockingReaderWriterQueue
 {
 private:
 	typedef ::moodycamel::ReaderWriterQueue<T, MAX_BLOCK_SIZE> ReaderWriterQueue;
-	
+
 public:
 	explicit BlockingReaderWriterQueue(size_t size = 15) AE_NO_TSAN
 		: inner(size), sema(new spsc_sema::LightweightSemaphore())
@@ -828,8 +887,8 @@ public:
 		}
 		return false;
 	}
-	
-	
+
+
 	// Attempts to dequeue an element; if the queue is empty,
 	// waits until an element is available, then dequeues it.
 	template<typename U>
@@ -887,7 +946,7 @@ public:
 	{
 		return inner.peek();
 	}
-	
+
 	// Removes the front element from the queue, if any, without returning it.
 	// Returns true on success, or false if the queue appeared empty at the time
 	// `pop` was called.
@@ -901,7 +960,7 @@ public:
 		}
 		return false;
 	}
-	
+
 	// Returns the approximate number of items currently in the queue.
 	// Safe to call from both the producer and consumer threads.
 	AE_FORCEINLINE size_t size_approx() const AE_NO_TSAN
@@ -926,7 +985,7 @@ private:
 	// Disable copying & assignment
 	BlockingReaderWriterQueue(BlockingReaderWriterQueue const&) {  }
 	BlockingReaderWriterQueue& operator=(BlockingReaderWriterQueue const&) {  }
-	
+
 private:
 	ReaderWriterQueue inner;
 	std::unique_ptr<spsc_sema::LightweightSemaphore> sema;
@@ -937,3 +996,8 @@ private:
 #ifdef AE_VCPP
 #pragma warning(pop)
 #endif
+
+// Local Variables: ***
+// c-basic-offset: 8 ***
+// indent-tabs-mode: t ***
+// End: ***
